@@ -1,6 +1,15 @@
-# Perfmon InfluxDB Exporter
+# Perfmon Data Exporters
 
-NodeJS application using Cisco Perfmon API to export data to InfluxDB. There are 3 ways this application will collect data from CUCM to export to InfluxDB.
+NodeJS applications for collecting Cisco Perfmon data and exporting to monitoring systems.
+
+## Available Exporters
+
+- **InfluxDB Exporter** (this README): Push model, stores data in InfluxDB
+- **Prometheus Exporter**: Pull model, metrics exposed for Prometheus scraping → [README-PROMETHEUS.md](README-PROMETHEUS.md)
+
+## InfluxDB Exporter
+
+This version pushes data to InfluxDB. There are 3 ways this application will collect data from CUCM:
 
 1. Collect objects for a specific server(s) based on a configuration file provided to application. File example is provided in the repo in the **data** folder. To use you must rename to **config.json** and make sure your volume is mapped correctly in the docker-compose.yml file. If no config.json file is present the application will move on to the next method. See below for more information.
 2. Collect all objects for a specific server(s) in a single request. This is done via the enviromental variable PM_OBJECT_COLLECT_ALL. This method has the greatest risk of being rate limited by CUCM API. To limit the risk of being rate limited, you can increase the PM_OBJECT_COLLECT_ALL_CONCURRENCY enviromental variable to regulate the number of objects collected at once. Other methods would be to use the PM_SERVERS enviromental variable to limit the servers being polled, or separate the objects into multiple requests based on different PM_INVERVAL. For example you could collect some objects every 15 seconds and other objects every 60 seconds. If using this method, it's suggested to keep the number of objects to a minimum to reduce the risk of being rate limited.

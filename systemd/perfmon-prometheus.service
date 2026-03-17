@@ -1,0 +1,29 @@
+[Unit]
+Description=Perfmon Prometheus Exporter
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+WorkingDirectory=/opt/perfmon-exporter
+ExecStart=/usr/bin/node main-prometheus-modular.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=perfmon-exporter
+
+# Environment
+Environment=NODE_ENV=production
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/perfmon-exporter
+
+[Install]
+WantedBy=multi-user.target

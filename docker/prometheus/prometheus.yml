@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: 'perfmon'
+    static_configs:
+      - targets: ['perfmon-exporter:9090']
+        labels:
+          environment: 'production'
+          service: 'cisco-perfmon'
