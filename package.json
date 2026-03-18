@@ -1,7 +1,7 @@
 {
   "name": "perfmon-influx-exporter",
   "description": "Docker container to collect Cisco Perfmon stats and export to InfluxDB.",
-  "version": "3.1.1",
+  "version": "4.0.0",
   "author": "Jeremy Worden <jeremy@automate.builders>",
   "repository": {
     "type": "git",
@@ -9,7 +9,7 @@
   },
   "private": true,
   "scripts": {
-    "start": "pm2 start ecosystem.config.js",
+    "start": "node main.js start",
     "development": "NODE_ENV=development node main.js",
     "test": "NODE_ENV=test node main.js",
     "staging": "NODE_ENV=staging node main.js",
@@ -25,7 +25,6 @@
     "cisco-axl": "*",
     "cisco-perfmon": "*",
     "commander": "^12.1.0",
-    "dotenv": "*",
     "envalid": "*",
     "fancy-log": "^2.0.0",
     "p-limit": "^3.1.0",

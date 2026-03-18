@@ -14,8 +14,8 @@ const validator = require("validator");
 
 
 // This creates a gatekeeper that only allows 2 promises to run at once
-const serverLimit = pLimit(env.PM_SERVER_CONCURRENCY);
-const objectLimit = pLimit(env.PM_OBJECT_COLLECT_ALL_CONCURRENCY);
+const serverLimit = pLimit(env.SERVER_CONCURRENCY);
+const objectLimit = pLimit(env.PERFMON_COUNTERS_CONCURRENCY);
 
 // InfluxDB setup
 const token = env.INFLUXDB_TOKEN;
@@ -27,82 +27,81 @@ const client = new InfluxDB({
 });
 
 // Loop settings
-const coolDownTimer = parseInt(env.PM_COOLDOWN_TIMER);
-var interval = parseInt(env.PM_INTERVAL);
+const coolDownTimer = parseInt(env.COOLDOWN_TIMER);
+// Per-loop intervals are passed directly to startLoop
 
 //SSO Array to store cookies for each server. This is used to keep the session alive and reduce the number of logins per interval.
 var ssoArr = sessionSSO.getSSOArray();
 
-// Rate control flag
-var rateControl = false;
+// Rate control - shared across all loops so either hitting a limit backs off both
+let rateControlActive = false;
+let rateControlTimer = null;
+const setRateControl = () => {
+  rateControlActive = true;
+  if (rateControlTimer) clearTimeout(rateControlTimer);
+  rateControlTimer = setTimeout(() => {
+    rateControlActive = false;
+    rateControlTimer = null;
+    log("Rate control cooldown complete. Resuming collection.");
+  }, env.RETRY_DELAY);
+  log(`Rate control detected. Pausing all collection for ${env.RETRY_DELAY / 1000} seconds.`);
+};
 
-async function roundRobin(tasks, interval, increaseIntervalOnFailure) {
-  let currentIndex = 0;
-  let currentInterval = interval;
-  const executeTask = async () => {
+// Track all active loops so the shutdown handler can stop them cleanly
+const activeLoops = [];
+
+function startLoop(fn, args, label, loopInterval) {
+  let currentInterval = loopInterval;
+  const tick = async () => {
+    if (rateControlActive) {
+      log(`${label}: Rate control active, skipping tick.`);
+      return;
+    }
     try {
-      const task = tasks[currentIndex];
-      await task.fn(...task.args);
+      await fn(...args);
       console.log("-".repeat(100));
-      // If task is successful, reset interval
-      if (interval != currentInterval) {
-        currentInterval = interval; // Reset interval if successful
-        log("Reseting Interval:", currentInterval);
-        clearIntervalAsync(intervalId);
-        intervalId = setIntervalAsync(executeTask, currentInterval);
+      if (currentInterval !== loopInterval) {
+        currentInterval = loopInterval;
+        log(`${label}: Resetting interval to ${currentInterval}ms.`);
+        clearIntervalAsync(loopId);
+        loopId = setIntervalAsync(tick, currentInterval);
+        activeLoops[activeLoops.indexOf(loopId)] = loopId;
       }
     } catch (error) {
-      if (error.action != "break") {
-        log.error("Error executing task:", error);
-        if (increaseIntervalOnFailure) {
-          currentInterval *= 2; // Increase interval on failure
-          clearIntervalAsync(intervalId);
-          log("Interval set to:", currentInterval);
-          intervalId = setIntervalAsync(executeTask, currentInterval);
-        }
-      } else {
-        // Break out of the loop and remove from tasks array
-        log.error("Error executing task:", error.message);
-        if (tasks.length > 1) {
-          tasks.splice(currentIndex, 1);
-          clearIntervalAsync(intervalId);
-          log("Interval set to:", currentInterval);
-          intervalId = setIntervalAsync(executeTask, currentInterval);
-        } else {
-          clearIntervalAsync(intervalId);
-        }
-      }
-    } finally {
-      currentIndex = (currentIndex + 1) % tasks.length;
+      log.error(`${label}: Error:`, error);
+      currentInterval *= 2;
+      log(`${label}: Interval increased to ${currentInterval}ms.`);
+      clearIntervalAsync(loopId);
+      loopId = setIntervalAsync(tick, currentInterval);
+      activeLoops[activeLoops.indexOf(loopId)] = loopId;
     }
   };
-  var intervalId = setIntervalAsync(executeTask, currentInterval);
+  let loopId = setIntervalAsync(tick, currentInterval);
+  activeLoops.push(loopId);
 }
 
-const retry = (fn, retriesLeft = env.PM_RETRY, retryInterval = env.PM_RETRY_DELAY, promiseDelay = env.PM_COOLDOWN_TIMER) => {
-  return new Promise(async (resolve, reject) => {
-    await new Promise((resolve) => setTimeout(resolve, promiseDelay));
-    fn()
-      .then(resolve)
-      .catch((error) => {
-        if (retriesLeft > 0) {
-          setTimeout(() => {
-            retry(fn, retriesLeft - 1, retryInterval).then(resolve, reject);
-          }, retryInterval);
-        } else {
-          reject(error);
-        }
-      });
-  });
-};
+let isShuttingDown = false;
+async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  log(`${signal} received. Stopping collection loops and shutting down.`);
+  // clearIntervalAsync waits for any in-flight tick to finish before resolving
+  await Promise.all(activeLoops.map((id) => clearIntervalAsync(id)));
+  log("All loops stopped. Exiting.");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const collectCounterData = async (servers, logPrefix) => {
   return new Promise(async (resolve, reject) => {
-    const perfmonObjectArr = env.PM_OBJECT_COLLECT_ALL.split(",");
+    let localRateControl = false;
+    const perfmonObjectArr = env.PERFMON_COUNTERS.split(",");
     const writeApi = client.getWriteApi(org, bucket);
-    log(`${logPrefix}: Found ${servers.callManager.length} server(s) in the cluster. Starting collection for each server, up to ${env.PM_SERVER_CONCURRENCY} at a time, if applicable.`);
+    log(`${logPrefix}: Found ${servers.callManager.length} server(s) in the cluster. Starting collection for each server, up to ${env.SERVER_CONCURRENCY} at a time, if applicable.`);
 
     const getPerfMonData = async (server) => {
       return new Promise(async (resolve, reject) => {
@@ -115,21 +114,20 @@ const collectCounterData = async (servers, logPrefix) => {
             },
             results: {},
             cooldownTimer: coolDownTimer / 1000 + " second(s)",
-            intervalTimer: interval / 1000 + " second(s)",
           };
           // Set the server name in our results. This is used for logging.
           jsonResults.server = server.processNodeName.value;
           log(`${logPrefix}: Collecting data for ${jsonResults.server}.`);
 
           // Set up the perfmon service. We will use this to collect the data from each server.
-          var perfmon_service = new perfMonService(jsonResults.server, env.CUCM_USERNAME, env.CUCM_PASSWORD, {}, env.PM_RETRY_FLAG);
-          log(`${logPrefix}: Found ${perfmonObjectArr.length} object(s) to collect on ${jsonResults.server}. Collecting ${env.PM_OBJECT_COLLECT_ALL_CONCURRENCY} objects at a time.`);
+          var perfmon_service = new perfMonService(jsonResults.server, env.CUCM_USERNAME, env.CUCM_PASSWORD, { retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
+          log(`${logPrefix}: Found ${perfmonObjectArr.length} object(s) to collect on ${jsonResults.server}. Collecting ${env.PERFMON_COUNTERS_CONCURRENCY} objects at a time.`);
 
           try {
             const ssoIndex = ssoArr.findIndex((element) => element.name === jsonResults.server);
             if (ssoIndex !== -1) {
               // Update the perfmon service with the SSO auth cookie
-              perfmon_service = new perfMonService(jsonResults.server, "", "", { cookie: ssoArr[ssoIndex].cookie }, env.PM_RETRY_FLAG);
+              perfmon_service = new perfMonService(jsonResults.server, "", "", { cookie: ssoArr[ssoIndex].cookie, retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
             } else {
               jsonResults.authMethod.basic++;
               // If we don't have a cookie, let's try to get one but doing a listCounter call.
@@ -143,8 +141,8 @@ const collectCounterData = async (servers, logPrefix) => {
             reject;
           }
 
-          log(`${logPrefix}: Will attempt to collect up to ${env.PM_RETRY} times with a ${env.PM_RETRY_DELAY / 1000} second delay between attempts.`);
-          log(`${logPrefix}: Will wait ${env.PM_COOLDOWN_TIMER / 1000} seconds between collecting each object.`);
+          log(`${logPrefix}: Will attempt to collect up to ${env.RETRY} times with a ${env.RETRY_DELAY / 1000} second delay between attempts.`);
+          log(`${logPrefix}: Will wait ${env.COOLDOWN_TIMER / 1000} seconds between collecting each object.`);
 
           const objectSSOIndex = ssoArr.findIndex((element) => element.name === jsonResults.server);
 
@@ -153,7 +151,10 @@ const collectCounterData = async (servers, logPrefix) => {
             if (objectSSOIndex !== -1) {
               jsonResults.authMethod.sso++;
             }
-            return objectLimit(() => retry(() => perfmon_service.collectCounterData(jsonResults.server, object), env.PM_RETRY, env.PM_RETRY_DELAY, env.PM_COOLDOWN_TIMER));
+            return objectLimit(async () => {
+              await delay(env.COOLDOWN_TIMER);
+              return perfmon_service.collectCounterData(jsonResults.server, object);
+            });
           });
 
           // Wait for all promises to resolve
@@ -193,7 +194,8 @@ const collectCounterData = async (servers, logPrefix) => {
 
           output.forEach((el) => {
             if (el?.status > 400) {
-              rateControl = true;
+              setRateControl();
+              localRateControl = true;
               returnResults.push({ object: el.object, count: -1 });
             } else if (el?.results && el?.results?.length > 0) {
               el.results.forEach((result) => {
@@ -255,11 +257,7 @@ const collectCounterData = async (servers, logPrefix) => {
         process.exit(0);
       });
 
-    // Check if we need to rate control
-    if (rateControl) {
-      // Reset rate control back to false
-      rateControl = false;
-      // Reject the promise to increase the interval
+    if (localRateControl) {
       reject("RateControl detected.");
     } else {
       resolve();
@@ -269,9 +267,10 @@ const collectCounterData = async (servers, logPrefix) => {
 
 const collectSessionData = async (servers, logPrefix) => {
   return new Promise(async (resolve, reject) => {
-    const perfmonSessionArr = env.PM_OBJECT_SESSION_PERCENTAGE.split(",");
+    let localRateControl = false;
+    const perfmonSessionArr = env.PERFMON_SESSIONS.split(",");
     const writeApi = client.getWriteApi(org, bucket);
-    log(`${logPrefix}: Found ${servers.callManager.length} server(s) in the cluster. Starting collection for each server, up to ${env.PM_SERVER_CONCURRENCY} at a time, if applicable.`);
+    log(`${logPrefix}: Found ${servers.callManager.length} server(s) in the cluster. Starting collection for each server, up to ${env.SERVER_CONCURRENCY} at a time, if applicable.`);
     let points = [];
     const getPerfMonData = async (server) => {
       let jsonResults = {
@@ -282,13 +281,12 @@ const collectSessionData = async (servers, logPrefix) => {
         },
         results: [],
         cooldownTimer: coolDownTimer / 1000 + " second(s)",
-        intervalTimer: interval / 1000 + " second(s)",
       };
       return new Promise(async (resolve, reject) => {
         jsonResults.server = server.processNodeName.value;
         log(`${logPrefix}: Collecting data for ${jsonResults.server}.`);
 
-        var perfmon_service = new perfMonService(jsonResults.server, env.CUCM_USERNAME, env.CUCM_PASSWORD, {}, env.PM_RETRY_FLAG);
+        var perfmon_service = new perfMonService(jsonResults.server, env.CUCM_USERNAME, env.CUCM_PASSWORD, { retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
         log(`${logPrefix}: Found ${perfmonSessionArr.length} objects to collect on ${jsonResults.server}.`);
 
         // Let's see if we have a cookie for this server, if so we will use it instead of basic auth.
@@ -296,7 +294,7 @@ const collectSessionData = async (servers, logPrefix) => {
         if (ssoIndex !== -1) {
           jsonResults.authMethod.sso++;
           // Update the perfmon service with the SSO auth cookie
-          perfmon_service = new perfMonService(jsonResults.server, "", "", { cookie: ssoArr[ssoIndex].cookie }, env.PM_RETRY_FLAG);
+          perfmon_service = new perfMonService(jsonResults.server, "", "", { cookie: ssoArr[ssoIndex].cookie, retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
         } else {
           jsonResults.authMethod.basic++;
         }
@@ -362,7 +360,8 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -383,7 +382,8 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -404,7 +404,8 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -413,7 +414,7 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         }
 
-        await delay(env.PM_OBJECT_SESSION_PERCENTAGE_SLEEP); // sleeping for 15 seconds to allow the server to generate the counter data
+        await delay(env.PERFMON_SESSIONS_SLEEP); // sleeping to allow the server to generate the counter data
 
         log(`${logPrefix}: Waiting 15 seconds for ${jsonResults.server} to generate counter data.`);
 
@@ -426,7 +427,7 @@ const collectSessionData = async (servers, logPrefix) => {
             collectSessionResults.results.forEach(function (result) {
               points.push(new Point(result.object).tag("host", result.host).tag("cstatus", result.cstatus).tag("instance", result.instance).floatField(result.counter, result.value));
             });
-            jsonResults.results.push({ name: `${functionName}`, message: `Collected ${collectSessionResults.results.length} observation points for ${jsonResults.server} after sleeping for ${env.PM_OBJECT_SESSION_PERCENTAGE_SLEEP}ms.` });
+            jsonResults.results.push({ name: `${functionName}`, message: `Collected ${collectSessionResults.results.length} observation points for ${jsonResults.server} after sleeping for ${env.PERFMON_SESSIONS_SLEEP}ms.` });
           } else {
             log("collectSessionData Error: No results returned.");
             process.exit(0);
@@ -434,7 +435,8 @@ const collectSessionData = async (servers, logPrefix) => {
         } catch (error) {
           let functionName = "collectSessionData";
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -455,7 +457,8 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -482,7 +485,8 @@ const collectSessionData = async (servers, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -527,11 +531,7 @@ const collectSessionData = async (servers, logPrefix) => {
         process.exit(0);
       });
 
-    // Check if we need to rate control
-    if (rateControl) {
-      // Reset rate control back to false
-      rateControl = false;
-      // Reject the promise to increase the interval
+    if (localRateControl) {
       reject("RateControl detected.");
     } else {
       resolve();
@@ -541,6 +541,7 @@ const collectSessionData = async (servers, logPrefix) => {
 
 const collectSessionConfig = async (data, logPrefix) => {
   return new Promise(async (resolve, reject) => {
+    let localRateControl = false;
     const writeApi = client.getWriteApi(org, bucket);
     log(`${logPrefix}: Starting collection from ${env.CUCM_HOSTNAME} using config.json file`);
     var parsedData = JSON.parse(data);
@@ -556,9 +557,8 @@ const collectSessionConfig = async (data, logPrefix) => {
           },
           results: [],
           cooldownTimer: coolDownTimer / 1000 + " second(s)",
-          intervalTimer: interval / 1000 + " second(s)",
         };
-        var perfmon_service = new perfMonService(env.CUCM_HOSTNAME, env.CUCM_USERNAME, env.CUCM_PASSWORD, {}, env.PM_RETRY_FLAG);
+        var perfmon_service = new perfMonService(env.CUCM_HOSTNAME, env.CUCM_USERNAME, env.CUCM_PASSWORD, { retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
         log(`${logPrefix}: Found ${parsedData.length} objects to collect on ${env.CUCM_HOSTNAME}.`);
 
         // Let's see if we have a cookie for this server, if so we will use it instead of basic auth.
@@ -566,7 +566,7 @@ const collectSessionConfig = async (data, logPrefix) => {
         if (ssoIndex !== -1) {
           jsonResults.authMethod.sso++;
           // Update the perfmon service with the SSO auth cookie
-          perfmon_service = new perfMonService(env.CUCM_HOSTNAME, "", "", { cookie: ssoArr[ssoIndex].cookie }, env.PM_RETRY_FLAG);
+          perfmon_service = new perfMonService(env.CUCM_HOSTNAME, "", "", { cookie: ssoArr[ssoIndex].cookie, retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
         } else {
           jsonResults.authMethod.basic++;
         }
@@ -588,7 +588,8 @@ const collectSessionConfig = async (data, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}` });
             resolve();
           } else {
@@ -602,14 +603,15 @@ const collectSessionConfig = async (data, logPrefix) => {
           // Collect the counter data from the server
           let addCounterResults = await perfmon_service.addCounter(sessionId, parsedData);
           if (addCounterResults.results) {
-            jsonResults.results.push({ name: `${functionName}`, message: `Adding ${objectCollectArr.length} object(s) for ${env.CUCM_HOSTNAME} with SessionId ${sessionIdResults.results} = ${addCounterResults.results}.` });
+            jsonResults.results.push({ name: `${functionName}`, message: `Adding ${parsedData.length} object(s) for ${env.CUCM_HOSTNAME} with SessionId ${sessionIdResults.results} = ${addCounterResults.results}.` });
           } else {
             log("addCounter Error: No results returned.");
             process.exit(0);
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -634,7 +636,8 @@ const collectSessionConfig = async (data, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -655,7 +658,8 @@ const collectSessionConfig = async (data, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -682,7 +686,8 @@ const collectSessionConfig = async (data, logPrefix) => {
           }
         } catch (error) {
           if (error.status >= 500) {
-            rateControl = true;
+            setRateControl();
+            localRateControl = true;
             jsonResults.results.push({ name: `${functionName}`, message: `Error: ${error.message} for ${jsonResults.server}.` });
             resolve();
           } else {
@@ -721,11 +726,7 @@ const collectSessionConfig = async (data, logPrefix) => {
         process.exit(0);
       });
 
-    // Check if we need to rate control
-    if (rateControl) {
-      // Reset rate control back to false
-      rateControl = false;
-      // Reject the promise to increase the interval
+    if (localRateControl) {
       reject("RateControl detected.");
     } else {
       resolve();
@@ -755,36 +756,37 @@ function commaSeparatedList(value) {
   return value.split(",");
 }
 
-function validateFQDN(value) {
-  if (validator.isFQDN(value) || validator.isIP(value)) {
-    return value;
-  } else {
-    throw new commander.InvalidOptionArgumentError("Invalid FQDN/IP Address format");
+function validateFQDNList(value) {
+  const hosts = value.split(",").map((v) => v.trim());
+  for (const host of hosts) {
+    if (!validator.isFQDN(host) && !validator.isIP(host)) {
+      throw new commander.InvalidOptionArgumentError(`Invalid FQDN/IP Address: ${host}`);
+    }
   }
+  return hosts;
 }
 
 (async () => {
   program
     .command("config")
     .description("download config file")
-    .requiredOption("-s,--server <fqdn>", "Fully qualified domain name or IP Address.", validateFQDN)
+    .requiredOption("-s,--server <fqdn>", "Comma separated list of FQDNs or IP Addresses.", validateFQDNList)
     .requiredOption("-o, --objects <objects>", "Comma separated list of objects.", commaSeparatedList)
+    .option("-c, --counters <counters>", "Comma separated list of specific counters to include (e.g. CallsActive,CallsCompleted). When omitted only percentage counters are included.", commaSeparatedList)
     .action(async (options) => {
       try {
-        const config = await getSessionConfig(options.server, options.objects);
-        // Convert JSON object to string
-        const jsonString = JSON.stringify(config);
-        // Write JSON string to file
-        // Get the current date
-        const currentDate = new Date();
-
-        // Format the date as YYYY-MM-DD
-        const formattedDate = currentDate.toISOString().slice(0, 10);
-
-        // Create a filename with the formatted date
+        const servers = options.server;
+        const allConfigs = [];
+        for (const server of servers) {
+          log(`PERFMON SESSION CONFIG: Generating config for ${server}...`);
+          const config = await getSessionConfig(server, options.objects, options.counters || null);
+          allConfigs.push(...config);
+        }
+        const jsonString = JSON.stringify(allConfigs, null, 2);
+        const formattedDate = new Date().toISOString().slice(0, 10);
         const filename = `config.${formattedDate}.json`;
         await fs.writeFile(path.join(__dirname, "data", filename), jsonString);
-        log(`PERFMON SESSION CONFIG: ${filename} successfully saved.`);
+        log(`PERFMON SESSION CONFIG: ${filename} successfully saved. ${allConfigs.length} counter/instance combinations across ${servers.length} server(s).`);
       } catch (err) {
         log.error("Error:", err);
       }
@@ -794,9 +796,9 @@ function validateFQDN(value) {
     .command("start", { isDefault: true })
     .description("Run the server natively")
     .action(async () => {
-      if (process.env.PM_DELAYED_START) {
-        log("Delaying start for", process.env.PM_DELAYED_START / 1000, "seconds.");
-        await delay(process.env.PM_DELAYED_START);
+      if (env.DELAYED_START) {
+        log("Delaying start for", env.DELAYED_START / 1000, "seconds.");
+        await delay(env.DELAYED_START);
       }
 
       // Get the servers from the AXL API or ENV. If we can't get the servers, we will exit the process.
@@ -808,28 +810,29 @@ function validateFQDN(value) {
       }
 
       try {
-        var tasks = [];
-        await checkAndRead(path.join(__dirname, "data", "config.json")).then((data) => {
-          if (data) {
-            tasks.push({ fn: collectSessionConfig, args: [data, "PERFMON SESSION CONFIG"] });
-          }
-        });
+        let hasTask = false;
 
-        if (env.PM_OBJECT_COLLECT_ALL) {
-          tasks.push({ fn: collectCounterData, args: [servers, "PERFMON COUNTER DATA"] });
-        } else {
-          log("PM_OBJECT_COLLECT_ALL env variable not set. Skipping collection.");
+        const configData = await checkAndRead(path.join(__dirname, "data", "config.json"));
+        if (configData) {
+          startLoop(collectSessionConfig, [configData, "PERFMON SESSION CONFIG"], "PERFMON SESSION CONFIG", env.CONFIG_INTERVAL);
+          hasTask = true;
         }
 
-        if (env.PM_OBJECT_SESSION_PERCENTAGE) {
-          tasks.push({ fn: collectSessionData, args: [servers, "PERFMON SESSION DATA"] });
+        if (env.PERFMON_COUNTERS) {
+          startLoop(collectCounterData, [servers, "PERFMON COUNTER DATA"], "PERFMON COUNTER DATA", env.COUNTER_INTERVAL);
+          hasTask = true;
         } else {
-          log("PM_OBJECT_SESSION_PERCENTAGE env variable not set. Skipping collection.");
+          log("PERFMON_COUNTERS env variable not set. Skipping collection.");
         }
 
-        if (tasks.length > 0) {
-          roundRobin(tasks, interval, true); // Start round-robin execution
+        if (env.PERFMON_SESSIONS) {
+          startLoop(collectSessionData, [servers, "PERFMON SESSION DATA"], "PERFMON SESSION DATA", env.SESSION_INTERVAL);
+          hasTask = true;
         } else {
+          log("PERFMON_SESSIONS env variable not set. Skipping collection.");
+        }
+
+        if (!hasTask) {
           log("No tasks to execute found. Exiting.");
           process.exit(0);
         }

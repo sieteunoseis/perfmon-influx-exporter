@@ -1,170 +1,152 @@
 # Perfmon InfluxDB Exporter
 
-NodeJS application using Cisco Perfmon API to export data to InfluxDB. There are 3 ways this application will collect data from CUCM to export to InfluxDB.
+NodeJS application using Cisco Perfmon API to export data to InfluxDB. There are three collection methods:
 
-1. Collect objects for a specific server(s) based on a configuration file provided to application. File example is provided in the repo in the **data** folder. To use you must rename to **config.json** and make sure your volume is mapped correctly in the docker-compose.yml file. If no config.json file is present the application will move on to the next method. See below for more information.
-2. Collect all objects for a specific server(s) in a single request. This is done via the enviromental variable PM_OBJECT_COLLECT_ALL. This method has the greatest risk of being rate limited by CUCM API. To limit the risk of being rate limited, you can increase the PM_OBJECT_COLLECT_ALL_CONCURRENCY enviromental variable to regulate the number of objects collected at once. Other methods would be to use the PM_SERVERS enviromental variable to limit the servers being polled, or separate the objects into multiple requests based on different PM_INVERVAL. For example you could collect some objects every 15 seconds and other objects every 60 seconds. If using this method, it's suggested to keep the number of objects to a minimum to reduce the risk of being rate limited.
-3. Collect all objects for a specific server(s) in a session based request that return percentage values. This is done via the enviromental variable PM_OBJECT_SESSION_PERCENTAGE and PM_OBJECT_SESSION_PERCENTAGE_SLEEP. Note this also has the risk of being rate limited by CUCM API, however the risk is lower than the PM_OBJECT_COLLECT_ALL method. As of CUCM 15 there are only five (Memory,Processor,Process,Partition,Thread) objects that return percentage values. This method is suggested for these objects only.
+1. **Session Config** (`config.json`) — Collects specific counters and instances defined in a static config file. Most efficient: 5 SOAP calls per cycle regardless of counter count. Recommended for all known/static devices (CallManager, MGCP, MOH, MTP, HW Conf Bridge, TFTP, etc).
+2. **Counter Data** (`PERFMON_COUNTERS`) — Collects all counters for a given object across all instances in a single request per object per server. Best for dynamic objects where instances change frequently, such as `Cisco SIP` (new trunks added without regenerating config).
+3. **Session Data** (`PERFMON_SESSIONS`) — Session-based collection that takes a baseline and observation sample to compute delta/percentage values. Required for counters that are cumulative by nature (e.g. `% CPU Time`, `% Mem Used`).
 
-Application will attempt to collect data in the order listed above. If any method is not present, it will move to the next method. If all methods are not present, the application will log an error and exit.
+If a method is not configured, it is skipped. At least one method must be configured or the application will exit.
+
+## Performance
+
+Using `config.json` dramatically reduces SOAP calls to CUCM compared to polling every object on every server via `PERFMON_COUNTERS`.
+
+| Method | SOAP calls/cycle | Cycle time (13 servers, 88 objects) |
+| --- | --- | --- |
+| `PERFMON_COUNTERS` (all objects) | 1,144 (88 × 13) | ~57 minutes |
+| `config.json` (Session Config) | **5** | ~5 seconds |
+| `PERFMON_COUNTERS` (Cisco SIP only) | 13 | ~39 seconds |
+| `PERFMON_SESSIONS` (5 objects) | ~169 | ~7.5 minutes |
+
+**Recommended approach:**
+
+- Put all known static devices in `config.json` — 5 SOAP calls covers everything regardless of how many counters
+- Use `PERFMON_COUNTERS` only for objects with frequently changing instances (e.g. `Cisco SIP` — new trunks are discovered automatically each cycle without regenerating config)
+- Use `PERFMON_SESSIONS` for delta/percentage counters that require baseline→observation sampling
+
+Regenerate `config.json` when hardware changes (new gateways, conference bridges, MGCP spans, etc).
 
 ## Features
 
 - Collects Perfmon data from CUCM and exports to InfluxDB
-- Uses pm2 for process management and recovery. Can be used with pm2.io for monitoring externally.
-- Docker container for easy deployment
-- Configurable via enviromental variables
-- Ability to generate config.json file for specific objects to collect
-- Ability to collect all objects for a specific server(s) in a single request
-- Ability to collect all objects for a specific server(s) in a session based request that return percentage values
-- Ability to stagger the start of the containers via PM_DELAYED_START enviromental variable
-- Ability to have multiple containers running with different objects to collect, saving to different buckets in InfluxDB.
-
-## Installation
-
-If you like to run the application locally, you can clone the repo and run the following commands:
-
-```node
-npm run docker:build
-npm run docker:run
-```
-
-## Enviromental Variables
-
-```node
-# Node.JS Settings - Comment out if you get certificate errors
-# NODE_TLS_REJECT_UNAUTHORIZED=0
-
-# PM2 Settings - Comment out if not using pm2.io
-# PM2_PUBLIC_KEY=
-# PM2_SECRET_KEY=
-
-# API Authentication Settings
-CUCM_HOSTNAME=<INSERT IP ADDRESS>
-CUCM_USERNAME=<INSERT USERNAME>
-CUCM_PASSWORD=<INSERT PASSWORD>
-CUCM_VERSION=<INSERT VERSION I.E. 12.5>
-
-# InfluxDB Settings
-INFLUXDB_TOKEN=<INSERT INFLUXDB TOKEN>
-INFLUXDB_ORG=<INSERT INFLUXDB ORG>
-INFLUXDB_BUCKET=<INSERT INFLUXDB BUCKET>
-INFLUXDB_URL=<INSERT INFLUXDB URL>
-
-# Perfmon Settings
-# PM_SERVERS=hq-cucm-pub.abc.inc,hq-cucm-sub.abc.inc - Remove comment if you'd only like to run on a single server or set of servers
-PM_INTERVAL=5000
-PM_COOLDOWN_TIMER=3000
-PM_RETRY=3
-PM_RETRY_DELAY=20000
-PM_SERVER_CONCURRENCY=2
-
-PM_OBJECT_COLLECT_ALL=Cisco Annunciator Device,Cisco AXL Web Service,Cisco Call Restriction,Cisco CallManager,Cisco CallManager System Performance,Cisco CAR DB,Cisco CTI Manager,Cisco Device Activation,Cisco Dual-Mode Mobility,Cisco Extension Mobility,Cisco Hunt Lists,Cisco Hunt Pilots,Cisco IP Manager Assistant,Cisco IVR Device,Cisco LBM Service,Cisco LDAP Directory,Cisco Locations LBM,Cisco Locations RSVP,Cisco Media Streaming App,Cisco Mobility Manager,Cisco MOH Device,Cisco MTP Device,Cisco Presence Features,Cisco QSIG Features,Cisco Recording,Cisco SAF Client,Cisco Signaling,Cisco SIP,Cisco SIP Line Normalization,Cisco SIP Normalization,Cisco SIP Stack,Cisco SIP Station,Cisco SW Conference Bridge Device,Cisco TFTP,Cisco Tomcat Connector,Cisco Tomcat JVM,Cisco Tomcat Web Application,Cisco Transcode Device,Cisco WebDialer,DB Local_DSN,DB User Host Information Counters,Enterprise Replication DBSpace Monitors,IP,IP6,Memory,Network Interface,Number of Replicates Created and State of Replication,Partition,Ramfs,SAML SSO,System,TCP,Thread
-PM_OBJECT_COLLECT_ALL_CONCURRENCY=10
-
-PM_OBJECT_SESSION_PERCENTAGE=Memory,Processor,Process,Partition,Thread
-PM_OBJECT_SESSION_PERCENTAGE_SLEEP=15000
-```
-
-Save to .env file within project. You can copy the provided example.
-
-```
-cp example.env .env
-``` 
-
-**DO NOT USE QUOTES OR DOUBLE QUOTES IN ENV FILE, THEY ARE NOT SUPPORTED.**
-
-https://docs.docker.com/compose/environment-variables/env-file/#syntax-rules
-
+- Docker container with `tini` for proper PID 1 signal handling and graceful shutdown
+- `config.json` generator — discovers instances dynamically across multiple servers and writes a static config file
+- Independent collection loops with shared rate-limit backoff
+- Configurable intervals per collection method
+- Graceful SIGTERM/SIGINT shutdown — waits for in-flight requests to complete
 
 ## Running via Docker
 
-- Create folder directory. Example: 
-```linux
-mkdir /docker/perfmon
-```
-- cd to new folder
-```
-cd /docker/perfmon
-```
-- Create docker-compose.yml > touch docker-compose.yml. Example provided in repo.
-```
+```bash
+mkdir /docker/perfmon && cd /docker/perfmon
 touch docker-compose.yml
-``` 
-- Create .env from above > touch .env. Example provided in repo.
-```
 touch .env
-```
-- Run > docker compose up -d
-```
 docker compose up -d
 ```
 
-#### Docker Compose file:
+### docker-compose.yml
 
-```docker
+```yaml
 services:
   perfmon:
-    image: sieteunoseis/perfmon-influx-exporter:latest
+    image: ghcr.io/sieteunoseis/perfmon-influx-exporter:latest
     command:
       - start
-    env_file:
-      - .env
+    restart: always
     volumes:
       - ./data:/usr/src/app/data
+    env_file:
+      - .env
 ```
 
-Note: Enviromental variables set the docker-compose.yml file will override the .env file. Useful if you have multiple containers running with different objects to collect, different InfuxDB buckets, or different servers to poll.
+#### Generating config.json
 
-#### Generating config.json file
+The `config` command queries CUCM to discover instances for the specified objects and writes a static `config.json`. Run this once to build your config, then re-run when devices change (new gateways, conference bridges, etc).
 
-Docker container has the ability to generate a config.json file for you. This is useful if you are unsure of the objects you'd like to collect. Creating a config.json file and mapping the volume will decreases the amount of data being collected from CUCM, which can help with rate limiting. This is also useful if you are only collecting data for a specific set of servers.
+```bash
+# Single server
+docker run --rm -v $(pwd)/data:/usr/src/app/data --env-file=.env \
+  ghcr.io/sieteunoseis/perfmon-influx-exporter:latest \
+  config -s "hq-cucm-pub.abc.inc" \
+  -o "Cisco CallManager,Cisco HW Conference Bridge Device,Cisco MGCP PRI Device,Cisco MOH Device,Cisco MTP Device,Cisco TFTP,Memory,Processor" \
+  --counters "CallsActive,CallsCompleted,HWConferenceActive,RegisteredHardwarePhones,RegisteredOtherStationDevices,MOHMulticastResourceActive,MOHUnicastResourceActive,MTPResourceActive,ResourceActive,HWConferenceCompleted,Requests,HttpRequests,% Mem Used,% CPU Time"
 
-Using Docker to generate the config.json file:
-
-```linux
-docker run -d -v $(pwd)/data:/usr/src/app/data --env-file=.env sieteunoseis/perfmon-influx-exporter:latest config hq-cucm-pub.abc.inc "Cisco AXL Tomcat Connector,Cisco AXL Tomcat JVM,Cisco AXL Tomcat Web Application,Cisco AXL Web Service,Cisco CallManager,Cisco CallManager System Performance"
+# Multiple servers (comma-separated)
+docker run --rm -v $(pwd)/data:/usr/src/app/data --env-file=.env \
+  ghcr.io/sieteunoseis/perfmon-influx-exporter:latest \
+  config -s "pub.example.com,sub1.example.com,sub2.example.com" \
+  -o "Cisco CallManager,Cisco MGCP PRI Device,Memory,Processor" \
+  --counters "CallsActive,CallsCompleted,RegisteredHardwarePhones,% Mem Used,% CPU Time"
 ```
 
-This will generate a config.json file in the data folder. You can then modify the file to include the objects you'd like to collect.
+The generated file is saved to `data/config.YYYY-MM-DD.json`. Rename or copy to `data/config.json` to activate it.
+
+When `--counters` is omitted, only percentage counters (`%` or `Percentage` in name) are included.
 
 ## Environment Variables
 
-| Variable                           | Type               | Default    | Description                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------------------------------- | ------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| NODE_ENV                           | string             | production | environment variable in Node.js that determines the current environment an application is running in, such as development, production, or testing                                                                                                                                                                                                                                                                  |
-| PM2_PUBLIC_KEY                     | string             | null       | pm2.io access. Optional if you want to view application metrics on pm2.io                                                                                                                                                                                                                                                                                                                                          |
-| PM2_SECRET_KEY                     | string             | null       | pm2.io access. Optional if you want to view application metrics on pm2.io                                                                                                                                                                                                                                                                                                                                          |
-| CUCM_HOSTNAME                      | FQDN or IP Address | null       | CUCM IP Address                                                                                                                                                                                                                                                                                                                                                                                                    |
-| CUCM_USERNAME                      | string             | null       | CUCM Username                                                                                                                                                                                                                                                                                                                                                                                                      |
-| CUCM_PASSWORD                      | string             | null       | CUCM Password                                                                                                                                                                                                                                                                                                                                                                                                      |
-| CUCM_VERSION                       | tenths             | null       | CUCM Version. Must include decimal. Example 15.0                                                                                                                                                                                                                                                                                                                                                                   |
-| INFLUXDB_TOKEN                     | token              | null       | InfluxDB API token.                                                                                                                                                                                                                                                                                                                                                                                                |
-| INFLUXDB_ORG                       | string             | null       | InfluxDB organization id.                                                                                                                                                                                                                                                                                                                                                                                          |
-| INFLUXDB_BUCKET                    | string             | null       | InfluxDB bucket to save data to.                                                                                                                                                                                                                                                                                                                                                                                   |
-| INFLUXDB_URL                       | URL                | null       | URL of InfluxDB. i.e. http://hostname:8086.                                                                                                                                                                                                                                                                                                                                                                        |
-| PM_SERVERS                         | string             | null       | Perfmon CUCM Server(s) to poll. If this is blank, application will use AXL to retrieve servers from cluster. Setting this is useful if you are collecting objects that only pertain to a specific set of servers. Example would be "Cisco MGCP PRI Device" would only return results for servers that match the device pools of your MGCP device. Also useful if feature does not run on all nodes in the cluster. |
-| PM_DELAYED_START                   | number             | null       | Delayed start of application. Useful if you are running multiple containers and want to stagger the start of the containers.                                                                                                                                                                                                                                                                                       |
-| PM_INTERVAL                        | milliseconds             | 5000       | Perfmon Interval to poll CUCM                                                                                                                                                                                                                                                                                                                                                                                      |
-| PM_COOLDOWN_TIMER                  | milliseconds             | 5000       | Perfmon Cooldown timer to wait before polling again                                                                                                                                                                                                                                                                                                                                                                |
-| PM_RETRY                           | int             | 3          | Perfmon retries before failing. Suggest limiting to no higher than 3 retries. Going high can result in incorrect data being returned from CUCM.                                                                                                                                                                                                                                                                    |
-| PM_RETRY_DELAY                     | milliseconds             | 15000      | Perfmon delay between retries                                                                                                                                                                                                                                                                                                                                                                                      |
-| PM_SERVER_CONCURRENCY              | int             | 1          | Perfmon number of servers to poll at once                                                                                                                                                                                                                                                                                                                                                                          |
-| PM_OBJECT_COLLECT_ALL              | string             | null       | Perfmon comma separated list of all objects to collect. Returns the perfmon data for all counters that belong to an object on a particular host. Unlike the session-based perfmon data collection, this operation collects all data in a single request and response transaction. For an object with multiple instances, data for all instances is returned.                                                       |
-| PM_OBJECT_COLLECT_ALL_CONCURRENCY  | int             | 1          | Perfmon number of objects to poll at once. Increasing this number runs the risk of being rate limited by CUCM API.                                                                                                                                                                                                                                                                                                 |
-| PM_OBJECT_SESSION_PERCENTAGE       | string             | null       | Perfmon comma separated list of all objects to collect. Performance counters that return percentage values require two or more samples to calculate performance counter changes.                                                                                                                                                                                                                                   |
-| PM_OBJECT_SESSION_PERCENTAGE_SLEEP | milliseconds             | 15000      | Perfmon sleep time between polling percentage objects.                                                                                                                                                                                                                                                                                                                                                             |
-## PERFMON OBJECTS
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `NODE_ENV` | string | production | Node environment (`development`, `production`, `staging`, `test`) |
+| `CUCM_HOSTNAME` | FQDN or IP | required | CUCM publisher hostname or IP address |
+| `CUCM_USERNAME` | string | required | CUCM AXL username |
+| `CUCM_PASSWORD` | string | required | CUCM AXL password |
+| `CUCM_VERSION` | string | required | CUCM version, e.g. `15.0` |
+| `INFLUXDB_TOKEN` | string | required | InfluxDB API token |
+| `INFLUXDB_ORG` | string | required | InfluxDB organization ID |
+| `INFLUXDB_BUCKET` | string | required | InfluxDB bucket name |
+| `INFLUXDB_URL` | URL | required | InfluxDB URL, e.g. `http://hostname:8086` |
+| `SERVERS` | string | null | Comma-separated list of servers to poll. If blank, servers are discovered via AXL. |
+| `SERVER_CONCURRENCY` | int | 1 | Number of servers to query in parallel. Reduce if rate limited. |
+| `RETRY_FLAG` | bool | true | Enable retry on failed requests |
+| `RETRY` | int | 3 | Number of retries on failure |
+| `RETRY_DELAY` | ms | 15000 | Delay between retries |
+| `COOLDOWN_TIMER` | ms | 5000 | Delay between object queries within `collectCounterData` |
+| `DELAYED_START` | ms | null | Delay before starting collection. Useful for staggering containers. |
+| `PERFMON_COUNTERS` | string | null | Comma-separated list of objects for `collectCounterData` (all counters, all instances, one request per object). Best for dynamic objects like `Cisco SIP`. |
+| `PERFMON_COUNTERS_CONCURRENCY` | int | 1 | Number of objects to query in parallel within `collectCounterData`. |
+| `COUNTER_INTERVAL` | ms | 5000 | Interval between `collectCounterData` cycles |
+| `PERFMON_SESSIONS` | string | null | Comma-separated list of objects for session-based delta collection. Use for objects with cumulative counters requiring baseline→observation sampling (e.g. `Memory,Processor,Process,Partition,Thread`). |
+| `PERFMON_SESSIONS_SLEEP` | ms | 15000 | Sleep between baseline and observation samples |
+| `SESSION_INTERVAL` | ms | 30000 | Interval between `collectSessionData` cycles |
+| `CONFIG_INTERVAL` | ms | 30000 | Interval between `collectSessionConfig` (config.json) cycles |
 
-Current list of Perfmon objects as of CUCM 15.0. Suggest removing any objects for features that you are not using. This will help with rate limiting. Check the logs for any object that returns 0 results
+**Note: Do not use quotes in the `.env` file.**
 
-Note: Processor object is a percentage only object. It is suggested to use the PM_OBJECT_SESSION_PERCENTAGE enviromental variable to collect this object. You can also use the built in config generator to create a config.json file with the objects you'd like to collect.
+## Example .env
 
-Tool to convert column to comma separated list: https://convert.town/column-to-comma-separated-list
+```env
+NODE_ENV=production
+CUCM_HOSTNAME=hq-cucm-pub.abc.inc
+CUCM_USERNAME=perfmon
+CUCM_PASSWORD=yourpassword
+CUCM_VERSION=15.0
 
-https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/service/15/rtmt/cucm_b_cisco-unified-rtmt-administration-15/cucm_m_performance-counters-and-alerts-15.html
+INFLUXDB_TOKEN=your-token
+INFLUXDB_ORG=your-org-id
+INFLUXDB_BUCKET=cisco_perfmon
+INFLUXDB_URL=http://influxdb:8086
 
-```text
+COOLDOWN_TIMER=3000
+COUNTER_INTERVAL=5000
+SESSION_INTERVAL=30000
+CONFIG_INTERVAL=30000
+
+# Dynamic objects — instances auto-discovered each cycle
+PERFMON_COUNTERS=Cisco SIP
+
+# Delta/percentage counters — require baseline→observation sampling
+PERFMON_SESSIONS=Memory,Processor,Process,Partition,Thread
+```
+
+## Perfmon Objects
+
+Full list of available Perfmon objects as of CUCM 15.0. Remove objects for features not in use.
+
+Reference: [CUCM 15 Performance Counters and Alerts](https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/service/15/rtmt/cucm_b_cisco-unified-rtmt-administration-15/cucm_m_performance-counters-and-alerts-15.html)
+
+```
 Cisco Analog Access
 Cisco Annunciator Device
 Cisco AXL Tomcat Connector
@@ -259,51 +241,35 @@ Thread
 
 ## Troubleshooting
 
-##### Verifing data via CUCM CLI:
+### Verify data via CUCM CLI
 
-```linux
+```shell
 show perf query counter "Cisco CallManager" "CallsActive"
 ```
 
-##### Rate Limiting
+### Rate Limiting
 
-If you are seeing errors in the logs:
+If you see errors like:
 
-```linux
-{
-  "status": 500,
-  "code": "Internal Server Error",
-  "host": "hq-cucm-pub.abc.inc",
-  "object": "SAML SSO",
-  "message": "Exceeded allowed rate for Perfmon information. Current allowed rate for perfmon information is 80 requests per minute.PerfmonService"
-}
+```
+Exceeded allowed rate for Perfmon information. Current allowed rate for perfmon information is 80 requests per minute.
 ```
 
-Suggest increasing the limit to 18 under the CUCM Enterprise Parameters for Rate Control → Allowed Device Queries Per Minute web interface.
+Increase the limit under CUCM Enterprise Parameters → Rate Control → Allowed Device Queries Per Minute. Also consider reducing `SERVER_CONCURRENCY` or `PERFMON_COUNTERS_CONCURRENCY`.
 
-##### Number of Nodes in the Cluster
+### CUCM Log Files
 
-In large cluster, configure your application to point SOAP clients to individual servers that have server specific Perfmon counters. This can be done via the **PM_SERVERS** enviromental variable.
-  
-##### Debugging CUCM Log files
-
-To view the log files on the CUCM server:
-
-```linux
-
+```shell
 file list activelog /tomcat/logs/soap/csv/ratecontrol*.csv page detail date reverse
 file view activelog /tomcat/logs/soap/csv/ratecontrol*.csv
-
-file list activelog /tomcat/logs/soap/csv/axis2ratecontrol*.csv page detail date reverse
-file view activelog /tomcat/logs/soap/csv/axis2ratecontrol*.csv
 
 file list activelog /tomcat/logs/soap/log4j/soap*.log page detail date reverse
 file view activelog /tomcat/logs/soap/log4j/soap*.log
 ```
 
-If you get a certificate error(s) you can try adding the following to your .env file:
+### Certificate Errors
 
-```node
+```env
 NODE_NO_WARNINGS=1
 NODE_TLS_REJECT_UNAUTHORIZED=0
 ```

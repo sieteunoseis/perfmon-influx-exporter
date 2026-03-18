@@ -4,12 +4,14 @@ const axlService = require("cisco-axl");
 const perfMonService = require("cisco-perfmon");
 
 // If not production load the local env file
-if (process.env.NODE_ENV === "development") {
-  require("dotenv").config({ path: path.join(__dirname, "..", "env", "development.env") });
-} else if (process.env.NODE_ENV === "test") {
-  require("dotenv").config({ path: path.join(__dirname, "..", "env", "test.env") });
-} else if (process.env.NODE_ENV === "staging") {
-  require("dotenv").config({ path: path.join(__dirname, "..", "env", "staging.env") });
+const envFiles = { development: "env/development.env", test: "env/test.env", staging: "env/staging.env" };
+const envFile = envFiles[process.env.NODE_ENV];
+if (envFile) {
+  try {
+    process.loadEnvFile(path.join(__dirname, "..", envFile));
+  } catch (e) {
+    // file doesn't exist, skip
+  }
 }
 
 const versionValid = makeValidator((x) => {
@@ -31,46 +33,58 @@ module.exports = {
     INFLUXDB_ORG: str({ desc: "InfluxDB organization id." }),
     INFLUXDB_BUCKET: str({ desc: "InfluxDB bucket to save data to." }),
     INFLUXDB_URL: str({ desc: "URL of InfluxDB. i.e. http://hostname:8086." }),
-    PM_SERVERS: str({
+    SERVERS: str({
       default: null,
       desc: "Comma separated string of servers to collect data from. If not provided, it will get the servers from AXL.",
     }),
-    PM_SERVER_CONCURRENCY: num({
+    SERVER_CONCURRENCY: num({
       default: 1,
       desc: "How many servers to query at once. Decrease if you are getting rate limited or 503 errors.",
     }),
-    PM_RETRY_FLAG: bool({default: true, desc: "Flag to retry failed queries. Default is false."}),
-    PM_RETRY: num({
+    RETRY_FLAG: bool({ default: true, desc: "Flag to retry failed queries." }),
+    RETRY: num({
       default: 3,
       desc: "How many times to retry a failed query. Default is 3.",
     }),
-    PM_RETRY_DELAY: num({
+    RETRY_DELAY: num({
       default: 15000,
       desc: "How long to wait between retries. Default is 15 seconds.",
     }),
-    PM_COOLDOWN_TIMER: num({
+    COOLDOWN_TIMER: num({
       default: 5000,
       desc: "Cool down timer. Time between collecting data for each object.",
     }),
-    PM_OBJECT_COLLECT_ALL: str({
+    PERFMON_COUNTERS: str({
       default: null,
-      desc: "Comma separated string of what object to collect. Returns the perfmon data for all counters that belong to an object on a particular host",
+      desc: "Comma separated list of perfmon objects to collect via collectCounterData (all counters, all instances, single request per object).",
     }),
-    PM_OBJECT_COLLECT_ALL_CONCURRENCY: num({
+    PERFMON_COUNTERS_CONCURRENCY: num({
       default: 1,
       desc: "How many objects to query at once. Decrease if you are getting rate limited or 503 errors.",
     }),
-    PM_INTERVAL: num({
+    COUNTER_INTERVAL: num({
       default: 5000,
-      desc: "Interval timer. Time between starting new collection period.",
+      desc: "Interval between collectCounterData cycles in milliseconds.",
     }),
-    PM_OBJECT_SESSION_PERCENTAGE: str({
+    PERFMON_SESSIONS: str({
       default: null,
-      desc: "Comma separated string of what counters to query. These are percentage counters that two or more samples to collect data.",
+      desc: "Comma separated list of perfmon objects for session-based percentage counter collection.",
     }),
-    PM_OBJECT_SESSION_PERCENTAGE_SLEEP: num({
+    PERFMON_SESSIONS_SLEEP: num({
       default: 15000,
-      desc: "How long to sleep between adding objects to a session and collecting data. This is for percentage counters that need time to collect data.",
+      desc: "How long to sleep between baseline and observation samples for percentage counters.",
+    }),
+    SESSION_INTERVAL: num({
+      default: 30000,
+      desc: "Interval between session-based collection cycles in milliseconds.",
+    }),
+    CONFIG_INTERVAL: num({
+      default: 30000,
+      desc: "Interval between config.json-based collection cycles in milliseconds.",
+    }),
+    DELAYED_START: num({
+      default: null,
+      desc: "Delayed start in milliseconds. Useful for staggering multiple containers.",
     }),
   }),
   getServers: async (env) => {
@@ -81,14 +95,14 @@ module.exports = {
       cucmuser: env.CUCM_USERNAME,
       cucmpass: env.CUCM_PASSWORD,
     };
-    var serverArr = (env.PM_SERVERS || "").split(",");
+    var serverArr = (env.SERVERS || "").split(",");
     var servers = {
       callManager: serverArr.map((server) => {
         return { processNodeName: { value: server } };
       }),
     };
 
-    if (!env.PM_SERVERS) {
+    if (!env.SERVERS) {
       var axl_service = new axlService(settings.cucmip, settings.cucmuser, settings.cucmpass, settings.version);
       // Let's get the servers via AXL
       var operation = "listCallManager";
@@ -100,10 +114,12 @@ module.exports = {
     }
     return servers;
   },
-  getSessionConfig: async (server, counterArr) => {
+  // counterFilter: optional array of counter names to include e.g. ["CallsActive","CallsCompleted"]
+  // When omitted, falls back to percentage-only counters (original behaviour)
+  getSessionConfig: async (server, counterArr, counterFilter = null) => {
     const env = module.exports.getBaseEnv;
     return new Promise(async (resolve, reject) => {
-      let perfmon_service = new perfMonService(server, env.CUCM_USERNAME, env.CUCM_PASSWORD);
+      let perfmon_service = new perfMonService(server, env.CUCM_USERNAME, env.CUCM_PASSWORD, { retries: env.RETRY, retryDelay: env.RETRY_DELAY }, env.RETRY_FLAG);
       var objectCollectArr = [];
       var listCounterResults;
       var listInstanceResults;
@@ -119,27 +135,30 @@ module.exports = {
         for (let i = 0; i < counterArr.length; i++) {
           listInstanceResults = await perfmon_service.listInstance(server, counterArr[i]);
           const findCounter = listCounterResults.results.find((counter) => counter.Name === counterArr[i]);
-          let MultiInstanceVal = findCounter?.MultiInstance;
-          let MultiInstance = /true/.test(MultiInstanceVal);
-          let locatePercentCounter = findCounter.ArrayOfCounter.item.filter(function (item) {
-            if (item.Name.includes("Percentage") || item.Name.includes("%")) {
-              return item;
-            }
-          });
+          let MultiInstance = /true/.test(findCounter?.MultiInstance);
 
-          // Loop through the list of instances and counters
-          for (let j = 0; j < locatePercentCounter.length; j++) {
-            for (let k = 0; k < listInstanceResults.results.length; k++) {
-              var collectSessionObj = {
+          // Select counters based on filter mode
+          const allCounters = findCounter.ArrayOfCounter.item;
+          let selectedCounters;
+          if (counterFilter && counterFilter.length > 0) {
+            // Explicit counter list — match by name (case-insensitive)
+            const filterLower = counterFilter.map((c) => c.toLowerCase());
+            selectedCounters = allCounters.filter((item) => filterLower.includes(item.Name.toLowerCase()));
+          } else {
+            // Default: percentage counters only
+            selectedCounters = allCounters.filter((item) => item.Name.includes("Percentage") || item.Name.includes("%"));
+          }
+
+          const instances = MultiInstance ? listInstanceResults.results : [{ Name: "" }];
+
+          for (const counter of selectedCounters) {
+            for (const instance of instances) {
+              objectCollectArr.push({
                 host: server,
-                object: "",
-                instance: "",
-                counter: "",
-              };
-              collectSessionObj.object = counterArr[i];
-              collectSessionObj.instance = MultiInstance ? listInstanceResults.results[k].Name : "";
-              collectSessionObj.counter = locatePercentCounter[j].Name;
-              objectCollectArr.push(collectSessionObj);
+                object: counterArr[i],
+                instance: instance.Name,
+                counter: counter.Name,
+              });
             }
           }
         }

@@ -1,4 +1,6 @@
-FROM node:latest
+FROM node:lts-alpine
+RUN apk add --no-cache tini
+
 # Create app directory
 WORKDIR /usr/src/app
 
@@ -7,13 +9,12 @@ WORKDIR /usr/src/app
 # where available (npm@5+)
 COPY package*.json ./
 
-RUN npm install pm2 -g
-RUN npm install
+RUN npm ci --omit=dev
 
 # Bundle app source
 COPY . .
 
-# Start PM2 Process via entrypoint.sh
+# Start via entrypoint.sh with tini as PID 1 for proper signal forwarding
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
