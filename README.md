@@ -12,12 +12,13 @@ If a method is not configured, it is skipped. At least one method must be config
 
 Using `config.json` dramatically reduces SOAP calls to CUCM compared to polling every object on every server via `PERFMON_COUNTERS`.
 
-| Method | SOAP calls/cycle | Cycle time (13 servers, 88 objects) |
-| --- | --- | --- |
-| `PERFMON_COUNTERS` (all objects) | 1,144 (88 × 13) | ~57 minutes |
-| `config.json` (Session Config) | **5** | ~5 seconds |
-| `PERFMON_COUNTERS` (Cisco SIP only) | 13 | ~39 seconds |
-| `PERFMON_SESSIONS` (5 objects) | ~169 | ~7.5 minutes |
+| Method | SOAP calls/cycle |
+| --- | --- |
+| `PERFMON_COUNTERS` | objects × servers (e.g. 88 objects × 6 servers = 528 calls) |
+| `config.json` (Session Config) | **5** — regardless of counter or server count |
+| `PERFMON_SESSIONS` | ~13 calls × servers |
+
+The `config.json` approach scales to any cluster size with no increase in SOAP calls. `PERFMON_COUNTERS` grows linearly with both object count and server count, and each call is followed by `COOLDOWN_TIMER`, making full-cycle times impractical for large object lists.
 
 **Recommended approach:**
 
