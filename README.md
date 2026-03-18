@@ -63,13 +63,15 @@ services:
 
 #### Generating config.json
 
-The `config` command queries CUCM to discover instances for the specified objects and writes a static `config.json`. Run this once to build your config, then re-run when devices change (new gateways, conference bridges, etc).
+The `config` command queries CUCM to discover instances for the specified objects and writes a static config file. Run this once to build your initial config, then re-run when devices change (new gateways, conference bridges, etc).
+
+Only CUCM env vars are required — InfluxDB env vars are not needed for the `config` command.
 
 ```bash
-# Single server
+# Single server — generates data/config.YYYY-MM-DD.json
 docker run --rm -v $(pwd)/data:/usr/src/app/data --env-file=.env \
   ghcr.io/sieteunoseis/perfmon-influx-exporter:latest \
-  config -s "hq-cucm-pub.abc.inc" \
+  config -s "hq-cucm-pub.example.com" \
   -o "Cisco CallManager,Cisco HW Conference Bridge Device,Cisco MGCP PRI Device,Cisco MOH Device,Cisco MTP Device,Cisco TFTP,Memory,Processor" \
   --counters "CallsActive,CallsCompleted,HWConferenceActive,RegisteredHardwarePhones,RegisteredOtherStationDevices,MOHMulticastResourceActive,MOHUnicastResourceActive,MTPResourceActive,ResourceActive,HWConferenceCompleted,Requests,HttpRequests,% Mem Used,% CPU Time"
 
@@ -84,6 +86,22 @@ docker run --rm -v $(pwd)/data:/usr/src/app/data --env-file=.env \
 The generated file is saved to `data/config.YYYY-MM-DD.json`. Rename or copy to `data/config.json` to activate it.
 
 When `--counters` is omitted, only percentage counters (`%` or `Percentage` in name) are included.
+
+#### Adding objects to an existing config.json
+
+Use `--merge` to add new objects/instances to an existing config without duplicating entries. New entries are appended; existing ones are left untouched.
+
+```bash
+# Add Cisco H323 entries to an existing config.json
+docker run --rm -v $(pwd)/data:/usr/src/app/data --env-file=.env \
+  ghcr.io/sieteunoseis/perfmon-influx-exporter:latest \
+  config -s "pub.example.com,sub1.example.com,sub2.example.com" \
+  -o "Cisco H323" \
+  --counters "CallsActive,CallsCompleted" \
+  --merge /usr/src/app/data/config.json
+```
+
+The merge is deduplicated by `host + object + instance + counter`, so re-running is safe.
 
 ## Environment Variables
 
@@ -147,7 +165,7 @@ Full list of available Perfmon objects as of CUCM 15.0. Remove objects for featu
 
 Reference: [CUCM 15 Performance Counters and Alerts](https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/service/15/rtmt/cucm_b_cisco-unified-rtmt-administration-15/cucm_m_performance-counters-and-alerts-15.html)
 
-```
+```text
 Cisco Analog Access
 Cisco Annunciator Device
 Cisco AXL Tomcat Connector
@@ -252,7 +270,7 @@ show perf query counter "Cisco CallManager" "CallsActive"
 
 If you see errors like:
 
-```
+```text
 Exceeded allowed rate for Perfmon information. Current allowed rate for perfmon information is 80 requests per minute.
 ```
 

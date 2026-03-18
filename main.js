@@ -773,6 +773,7 @@ function validateFQDNList(value) {
     .requiredOption("-s,--server <fqdn>", "Comma separated list of FQDNs or IP Addresses.", validateFQDNList)
     .requiredOption("-o, --objects <objects>", "Comma separated list of objects.", commaSeparatedList)
     .option("-c, --counters <counters>", "Comma separated list of specific counters to include (e.g. CallsActive,CallsCompleted). When omitted only percentage counters are included.", commaSeparatedList)
+    .option("-m, --merge <path>", "Path to an existing config JSON file to merge new entries into.")
     .action(async (options) => {
       try {
         const servers = options.server;
@@ -782,11 +783,22 @@ function validateFQDNList(value) {
           const config = await getSessionConfig(server, options.objects, options.counters || null);
           allConfigs.push(...config);
         }
-        const jsonString = JSON.stringify(allConfigs, null, 2);
-        const formattedDate = new Date().toISOString().slice(0, 10);
-        const filename = `config.${formattedDate}.json`;
-        await fs.writeFile(path.join(__dirname, "data", filename), jsonString);
-        log(`PERFMON SESSION CONFIG: ${filename} successfully saved. ${allConfigs.length} counter/instance combinations across ${servers.length} server(s).`);
+
+        let finalConfigs = allConfigs;
+        if (options.merge) {
+          const mergePath = path.resolve(options.merge);
+          const existing = JSON.parse(await fs.readFile(mergePath, "utf8"));
+          const existingKeys = new Set(existing.map((e) => `${e.host}|${e.object}|${e.instance}|${e.counter}`));
+          const newEntries = allConfigs.filter((e) => !existingKeys.has(`${e.host}|${e.object}|${e.instance}|${e.counter}`));
+          finalConfigs = [...existing, ...newEntries];
+          await fs.writeFile(mergePath, JSON.stringify(finalConfigs, null, 2));
+          log(`PERFMON SESSION CONFIG: Merged ${newEntries.length} new entries into ${mergePath}. Total: ${finalConfigs.length} entries.`);
+        } else {
+          const formattedDate = new Date().toISOString().slice(0, 10);
+          const filename = `config.${formattedDate}.json`;
+          await fs.writeFile(path.join(__dirname, "data", filename), JSON.stringify(finalConfigs, null, 2));
+          log(`PERFMON SESSION CONFIG: ${filename} successfully saved. ${finalConfigs.length} counter/instance combinations across ${servers.length} server(s).`);
+        }
       } catch (err) {
         log.error("Error:", err);
       }

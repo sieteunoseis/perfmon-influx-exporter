@@ -1,4 +1,0 @@
-Error check for:
-
-<faultcode>soapenv:Server</faultcode>
-<faultstring>Error found in Adding counters: Error=9 ErrorMsg=\\hq-cucm-pub.abc.inc\Cisco CallManager\AnnunciatorOutOfResources;</faultstring>
