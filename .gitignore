@@ -4,3 +4,6 @@
 /net-commander
 /data/config.json
 /data/config.*.json
+
+
+.DS_Store
